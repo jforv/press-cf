@@ -1,0 +1,126 @@
+---
+# nfs_do_volume.yml
+#
+# Sets up a shared NFS export on the primary (unified) Droplet so that
+# secondary app-only Droplets can mount the bench directory during scale-out.
+#
+# This playbook is run on the PRIMARY server only.
+#
+# Prerequisites:
+#   - A DigitalOcean Volume is already attached to this Droplet.
+#   - The Volume is visible as /dev/sda (or specify via `do_volume_device`).
+#   - NFS clients (secondary Droplets) are on the same VPC private network.
+#
+# Usage:
+#   ansible-playbook -i "<primary_ip>," nfs_do_volume.yml \
+#     -e "do_volume_device=/dev/disk/by-id/scsi-<volume-id>" \
+#     -e "nfs_export_network=10.0.0.0/8"
+
+- name: Setup NFS shared bench volume on primary Droplet
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    do_volume_device: /dev/sda         # Override with actual DO Volume device path
+    nfs_mount_point: /home/frappe/benches
+    nfs_export_network: "10.0.0.0/8"  # DigitalOcean VPC CIDR — restrict to your VPC
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1. Install NFS server
+    # ------------------------------------------------------------------
+    - name: Install NFS kernel server
+      ansible.builtin.package:
+        name: nfs-kernel-server
+        state: present
+        update_cache: true
+
+    # ------------------------------------------------------------------
+    # 2. Format and mount the DigitalOcean Volume
+    # ------------------------------------------------------------------
+    - name: Check if volume already has a filesystem
+      ansible.builtin.command: blkid -o value -s TYPE "{{ do_volume_device }}"
+      register: blkid_out
+      changed_when: false
+      failed_when: false
+
+    - name: Format volume with ext4 (only if no filesystem found)
+      ansible.builtin.command: mkfs.ext4 -F "{{ do_volume_device }}"
+      when: blkid_out.stdout == ""
+
+    - name: Create NFS mount point
+      ansible.builtin.file:
+        path: "{{ nfs_mount_point }}"
+        state: directory
+        owner: frappe
+        group: frappe
+        mode: "0755"
+
+    - name: Mount the DigitalOcean Volume
+      ansible.posix.mount:
+        path: "{{ nfs_mount_point }}"
+        src: "{{ do_volume_device }}"
+        fstype: ext4
+        opts: defaults,nofail,discard
+        state: mounted
+
+    - name: Ensure frappe owns the mount point
+      ansible.builtin.file:
+        path: "{{ nfs_mount_point }}"
+        owner: frappe
+        group: frappe
+        recurse: false
+
+    # ------------------------------------------------------------------
+    # 3. Configure NFS exports
+    # ------------------------------------------------------------------
+    - name: Add NFS export entry
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        line: "{{ nfs_mount_point }} {{ nfs_export_network }}(rw,sync,no_subtree_check,no_root_squash)"
+        state: present
+        create: true
+        mode: "0644"
+
+    - name: Reload NFS exports
+      ansible.builtin.command: exportfs -ra
+      changed_when: true
+
+    - name: Ensure NFS server is enabled and running
+      ansible.builtin.service:
+        name: nfs-kernel-server
+        state: started
+        enabled: true
+
+    # ------------------------------------------------------------------
+    # 4. Firewall — allow NFS from VPC CIDR only
+    # ------------------------------------------------------------------
+    - name: Allow NFS (port 2049) from VPC network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "2049"
+        source: "{{ nfs_export_network }}"
+        jump: ACCEPT
+        comment: "Allow NFS from VPC for Press scale-out"
+
+    - name: Allow NFS (port 2049 UDP) from VPC network
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: udp
+        destination_port: "2049"
+        source: "{{ nfs_export_network }}"
+        jump: ACCEPT
+        comment: "Allow NFS UDP from VPC for Press scale-out"
+
+    - name: Save iptables rules
+      ansible.builtin.command: netfilter-persistent save
+      changed_when: true
+      failed_when: false  # iptables-persistent may not be installed; DO cloud firewall is preferred
+
+  handlers:
+    - name: restart nfs
+      ansible.builtin.service:
+        name: nfs-kernel-server
+        state: restarted

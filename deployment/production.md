@@ -114,3 +114,113 @@ sudo supervisorctl update
 ```
 
 > **NOTE**: This will take some time
+
+---
+
+## Single Droplet Setup (DigitalOcean + Cloudflare)
+
+This section covers deploying Press on a **single unified DigitalOcean Droplet**
+where the app server, MariaDB, Redis, and Nginx all run on the same machine
+(`is_unified_server = True`). Horizontal scale-out adds app-only Droplets
+on demand via the existing `AutoScaleRecord` machinery.
+
+### Recommended Droplet Specs
+
+| Use case | vCPU | RAM | Disk |
+|---|---|---|---|
+| Small (\<50 managed sites) | 4 | 16 GB | 100 GB SSD |
+| Medium (50–200 sites) | 8 | 32 GB | 200 GB SSD |
+| Large (200+ sites / scale-out) | 16 | 64 GB | 400 GB SSD |
+
+Create the Droplet with **Ubuntu 22.04**, enable **private networking** (VPC),
+and attach a **Block Volume** (≥100 GB) if you intend to scale out later.
+
+### Phase 1 — Install Press
+
+```sh
+# 1. Install bench
+pip install frappe-bench
+
+# 2. Initialise bench (Frappe v15)
+bench init frappe-bench --frappe-branch version-15
+cd frappe-bench
+
+# 3. Install Press app
+bench get-app press https://github.com/frappe/press
+bench --site <your-site> install-app press
+
+# 4. Copy deployment config
+cp apps/press/deployment/common_site_config.json sites/common_site_config.json
+cp apps/press/deployment/supervisor.conf config/supervisor.conf
+
+# 5. Apply supervisor config
+sudo supervisorctl reread && sudo supervisorctl update
+```
+
+### Phase 2 — Configure Press Settings
+
+In the Press admin UI (`/app/press-settings`), set:
+
+| Field | Value |
+|---|---|
+| `dns_provider` | `Cloudflare` |
+| `cloudflare_api_token` | Your Cloudflare API token (Zone:Edit) |
+| `cloudflare_zone_id` | Your Cloudflare Zone ID |
+| `docker_registry_url` | `registry.digitalocean.com` |
+
+> **Cloudflare DNS note**: Set all Press-managed CNAMEs to **DNS-only (grey cloud)**
+> in Cloudflare. Press requires direct IP access and does not work behind Cloudflare
+> proxy/orange-cloud mode.
+
+### Phase 3 — Enable Single-Server Auto-Scaling
+
+Run the one-time setup script:
+
+```sh
+bench --site <your-site> execute press.deployment.setup_single_server.execute
+```
+
+This enables RAM-aware worker allocation (`new_worker_allocation`) on all servers
+and opts all active benches into dynamic scaling (`auto_scale_workers`).
+
+To also create Prometheus CPU alert rules (requires a secondary server configured):
+
+```sh
+bench --site <your-site> execute press.deployment.setup_single_server.execute \
+  --kwargs '{"setup_prometheus": true, "scale_up_cpu_threshold": 80, "scale_down_cpu_threshold": 30}'
+```
+
+### Phase 4 — Shared Volume for Scale-Out (Optional)
+
+Required only if you want Press to spin up additional app-only Droplets automatically.
+
+```sh
+# On the primary Droplet — attach a DO Block Volume first, then:
+ansible-playbook -i "<primary_private_ip>," \
+  apps/press/press/playbooks/nfs_do_volume.yml \
+  -e "do_volume_device=/dev/disk/by-id/scsi-<volume-id>" \
+  -e "nfs_export_network=<your-vpc-cidr>"
+```
+
+In Press Settings, set `shared_directory` to `/home/frappe/benches`.
+
+Then configure a secondary Server record in Press (app-only Droplet) and call
+`Server.add_automated_scaling_triggers()` via the Press dashboard.
+
+### Verification
+
+```sh
+# Check worker counts updated dynamically
+bench --site <your-site> execute press.press.doctype.server.server.scale_workers \
+  --kwargs '{"now": true}'
+
+# Confirm Cloudflare DNS sync is working
+# Create a test site → verify CNAME appears in Cloudflare dashboard
+
+# Check supervisor processes
+sudo supervisorctl status all
+
+# Monitor auto-scale queue
+bench --site <your-site> execute frappe.utils.background_jobs.get_jobs \
+  --kwargs '{"site": "<your-site>", "queue": "auto-scale"}'
+```

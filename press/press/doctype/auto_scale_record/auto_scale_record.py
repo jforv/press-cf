@@ -374,6 +374,14 @@ class AutoScaleRecord(Document, AutoScaleStepFailureHandler, StepHandler):
 				auto_scale_trigger.enabled = 1
 				auto_scale_trigger.save()
 
+		# Immediately rebalance workers across benches so the new capacity is
+		# used without waiting for the next */15 cron tick
+		frappe.enqueue(
+			"press.press.doctype.server.server.scale_workers",
+			queue="short",
+			enqueue_after_commit=True,
+		)
+
 		step.status = Status.Success
 		step.save()
 
@@ -770,7 +778,16 @@ def validate_scheduled_autoscale(primary_server: str) -> None:
 
 
 def run_scheduled_scale_records():
-	"""Run 5 scale scheduled scale records at a time"""
+	"""Run up to 5 scheduled Auto Scale Records at a time.
+
+	On a single-Droplet deployment, only one scale operation should be in-flight
+	at a time to avoid resource contention. If any record is already Running, we
+	skip this tick and try again on the next cron invocation.
+	"""
+	# Concurrency backpressure: bail out if a scale is already in progress
+	if frappe.db.exists("Auto Scale Record", {"status": "Running"}):
+		return
+
 	scale_records = frappe.get_all(
 		"Auto Scale Record",
 		{

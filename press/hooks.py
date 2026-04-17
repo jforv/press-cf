@@ -189,6 +189,12 @@ doc_events = {
 			"press.press.doctype.server_firewall.server_firewall.from_server",
 		],
 	},
+	# Cloudflare DNS sync — hooks are no-ops when dns_provider != "Cloudflare"
+	"Site Domain": {
+		"after_insert": "press.utils.cloudflare_dns.on_site_domain_insert",
+		"on_update": "press.utils.cloudflare_dns.on_site_domain_update",
+		"on_trash": "press.utils.cloudflare_dns.on_site_domain_trash",
+	},
 }
 
 # Scheduled Tasks
@@ -328,6 +334,8 @@ scheduler_events = {
 			"press.press.doctype.razorpay_payment_record.razorpay_payment_record.fetch_pending_payment_orders",
 		],
 		"*/15 * * * *": [
+			# Run scale_workers every 15 min so the single-Droplet responds quickly to load
+			"press.press.doctype.server.server.scale_workers",
 			"press.press.doctype.site_update.site_update.schedule_updates",
 			"press.press.doctype.site.backups.schedule_logical_backups",
 			"press.press.doctype.site.backups.schedule_physical_backups",
